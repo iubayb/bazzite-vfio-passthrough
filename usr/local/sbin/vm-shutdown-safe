@@ -1,0 +1,66 @@
+#!/bin/bash
+
+set -u
+
+VM="${1:-}"
+TIMEOUT_SEC="${2:-150}"
+
+if [ -z "$VM" ]; then
+    echo "usage: vm-shutdown-safe <vm-name> [timeout-seconds]"
+    exit 2
+fi
+
+state=$(virsh -c qemu:///system domstate "$VM" 2>/dev/null || true)
+if [ "$state" = "shut off" ]; then
+    echo "[$VM] already shut off"
+    exit 0
+fi
+
+agent_shutdown_sent=0
+
+if virsh -c qemu:///system qemu-agent-command "$VM" '{"execute":"guest-ping"}' >/dev/null 2>&1; then
+    echo "[$VM] requesting guest shutdown via qemu-agent"
+    virsh -c qemu:///system qemu-agent-command "$VM" '{"execute":"guest-shutdown","arguments":{"mode":"powerdown"}}' >/dev/null 2>&1 || true
+    agent_shutdown_sent=1
+else
+    echo "[$VM] qemu-agent unavailable, requesting ACPI shutdown"
+    virsh -c qemu:///system shutdown "$VM" >/dev/null 2>&1 || true
+    virsh -c qemu:///system qemu-monitor-command "$VM" --hmp "system_powerdown" >/dev/null 2>&1 || true
+fi
+
+for i in $(seq 1 "$TIMEOUT_SEC"); do
+    s=$(virsh -c qemu:///system domstate "$VM" 2>/dev/null || true)
+    if [ "$s" = "shut off" ]; then
+        echo "[$VM] shut off gracefully"
+        exit 0
+    fi
+
+    if [ "$agent_shutdown_sent" -eq 0 ] && [ $((i % 10)) -eq 0 ]; then
+        if virsh -c qemu:///system qemu-agent-command "$VM" '{"execute":"guest-ping"}' >/dev/null 2>&1; then
+            echo "[$VM] qemu-agent became available, sending guest shutdown"
+            virsh -c qemu:///system qemu-agent-command "$VM" '{"execute":"guest-shutdown","arguments":{"mode":"powerdown"}}' >/dev/null 2>&1 || true
+            agent_shutdown_sent=1
+        fi
+    fi
+
+    if [ $((i % 30)) -eq 0 ]; then
+        virsh -c qemu:///system shutdown "$VM" >/dev/null 2>&1 || true
+    fi
+
+    sleep 1
+done
+
+echo "[$VM] graceful shutdown timeout, forcing destroy"
+virsh -c qemu:///system destroy "$VM" >/dev/null 2>&1 || true
+
+for _ in $(seq 1 30); do
+    s=$(virsh -c qemu:///system domstate "$VM" 2>/dev/null || true)
+    if [ "$s" = "shut off" ]; then
+        echo "[$VM] destroyed successfully"
+        exit 0
+    fi
+    sleep 1
+done
+
+echo "[$VM] failed to stop"
+exit 1

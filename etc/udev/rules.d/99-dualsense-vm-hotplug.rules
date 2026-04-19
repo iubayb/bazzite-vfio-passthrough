@@ -1,0 +1,7 @@
+# DualSense USB (054c:0ce6) hotplug for bazzite VM.
+#
+# Uses host USB passthrough reattach, so unplug/replug restores the controller
+# inside the running VM without restarting it.
+
+ACTION=="add",SUBSYSTEM=="usb",ENV{DEVTYPE}=="usb_device",ATTR{idVendor}=="054c",ATTR{idProduct}=="0ce6",RUN+="/usr/local/sbin/dualsense-vm-hotplug add"
+ACTION=="remove",SUBSYSTEM=="usb",ENV{DEVTYPE}=="usb_device",ENV{ID_VENDOR_ID}=="054c",ENV{ID_MODEL_ID}=="0ce6",RUN+="/usr/local/sbin/dualsense-vm-hotplug remove"

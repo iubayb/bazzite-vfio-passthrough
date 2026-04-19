@@ -1,0 +1,104 @@
+#!/bin/bash
+# Deferred GPU reclaim worker for bazzite VM passthrough release.
+
+set -u
+
+GUEST="${1:-bazzite}"
+LOG=/var/log/libvirt-hooks.log
+STATE_ROOT=/run/libvirt/hook-state
+GPU_FUNCS=(0000:03:00.0 0000:03:00.1 0000:03:00.2 0000:03:00.3)
+NEED_RESCAN=0
+
+exec >>"$LOG" 2>&1
+
+log() {
+    echo "[$(date '+%F %T')] reclaim[$GUEST]: $*"
+}
+
+driver_for() {
+    local func="$1"
+    local drv_link
+    drv_link=$(readlink "/sys/bus/pci/devices/$func/driver" 2>/dev/null || true)
+    if [ -n "$drv_link" ]; then
+        basename "$drv_link"
+    else
+        echo "NONE"
+    fi
+}
+
+mkdir -p "$STATE_ROOT"
+exec 9>"$STATE_ROOT/${GUEST}.lock"
+if ! flock -w 90 9; then
+    log "ABORT: lock timeout"
+    exit 1
+fi
+
+if [ "$(driver_for 0000:03:00.0)" != "vfio-pci" ]; then
+    log "skip reclaim: 03:00.0 already on $(driver_for 0000:03:00.0)"
+    exit 0
+fi
+
+if grep -q '^amdgpu ' /proc/modules 2>/dev/null; then
+    log "amdgpu loaded at worker start; trying module unload first"
+    modprobe -r amdxcp drm_ttm_helper drm_suballoc_helper drm_buddy 2>/dev/null || true
+    modprobe -r amdgpu 2>/dev/null || true
+    sleep 1
+fi
+
+if grep -q '^amdgpu ' /proc/modules 2>/dev/null; then
+    log "amdgpu still loaded; enabling remove+rescan fallback"
+    NEED_RESCAN=1
+fi
+
+log "start deferred reclaim"
+
+for f in "${GPU_FUNCS[@]}"; do
+    if [ "$(driver_for "$f")" = "vfio-pci" ]; then
+        echo "$f" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null || true
+    fi
+    echo "" > "/sys/bus/pci/devices/$f/driver_override" 2>/dev/null || true
+done
+
+sleep 1
+
+if [ "$NEED_RESCAN" = "1" ]; then
+    for f in "${GPU_FUNCS[@]}"; do
+        if [ -e "/sys/bus/pci/devices/$f/remove" ]; then
+            echo 1 > "/sys/bus/pci/devices/$f/remove" 2>/dev/null || true
+        fi
+    done
+    sleep 1
+    echo 1 > /sys/bus/pci/rescan 2>/dev/null || true
+    sleep 2
+fi
+
+modprobe amdgpu 2>/dev/null || true
+for f in "${GPU_FUNCS[@]}"; do
+    echo "$f" > /sys/bus/pci/drivers_probe 2>/dev/null || true
+done
+
+sleep 2
+
+if [ "$(driver_for 0000:03:00.0)" != "amdgpu" ]; then
+    log "first probe miss: 03:00.0 is $(driver_for 0000:03:00.0), retrying binds"
+    echo "0000:03:00.0" > /sys/bus/pci/drivers/amdgpu/bind 2>/dev/null || true
+    echo "0000:03:00.1" > /sys/bus/pci/drivers/snd_hda_intel/bind 2>/dev/null || true
+    echo "0000:03:00.2" > /sys/bus/pci/drivers/xhci_hcd/bind 2>/dev/null || true
+    echo "0000:03:00.3" > /sys/bus/pci/drivers/i2c-designware-pci/bind 2>/dev/null || true
+    for f in "${GPU_FUNCS[@]}"; do
+        echo "$f" > /sys/bus/pci/drivers_probe 2>/dev/null || true
+    done
+    sleep 2
+fi
+
+for f in "${GPU_FUNCS[@]}"; do
+    log "$f driver=$(driver_for "$f")"
+done
+
+if [ "$(driver_for 0000:03:00.0)" = "amdgpu" ]; then
+    log "reclaim success"
+    exit 0
+fi
+
+log "CRITICAL reclaim failed: 03:00.0=$(driver_for 0000:03:00.0)"
+exit 1

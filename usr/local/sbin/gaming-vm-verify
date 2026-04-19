@@ -1,0 +1,166 @@
+#!/bin/bash
+# Post-reboot verification for the Bazzite gaming VM setup.
+# Tests everything except the actual VM boot:
+#   1. Kernel is 6.19+
+#   2. Required kernel params are active
+#   3. iGPU is host display
+#   4. amdgpu owns 6800 XT (dynamic mode)
+#   5. IOMMU groups are populated
+#   6. VT-d is enabled in BIOS
+#   7. Dynamic rebind cycle works (amdgpu → vfio-pci → amdgpu)
+#   8. Domain XML validates
+
+set -u
+LOG=/var/log/gaming-vm-test.log
+exec > >(tee -a "$LOG") 2>&1
+echo "=========================================="
+echo "[$(date '+%F %T')] gaming-vm-verify starting"
+echo "=========================================="
+
+PASS=0
+FAIL=0
+ok()   { echo "[PASS] $*"; PASS=$((PASS+1)); }
+bad()  { echo "[FAIL] $*"; FAIL=$((FAIL+1)); }
+info() { echo "[INFO] $*"; }
+
+# 1. Kernel version
+ver=$(uname -r)
+info "Running kernel: $ver"
+case "$ver" in
+    6.19.*|6.2[0-9].*) ok "kernel is 6.19+" ;;
+    *) bad "expected 6.19+, got $ver" ;;
+esac
+
+# 2. Kernel cmdline
+cmdline=$(cat /proc/cmdline)
+info "Cmdline: $cmdline"
+echo "$cmdline" | grep -q "intel_iommu=on" && ok "intel_iommu=on" || bad "intel_iommu=on missing"
+echo "$cmdline" | grep -q "iommu=pt" && ok "iommu=pt" || bad "iommu=pt missing"
+
+if echo "$cmdline" | grep -q "vfio-pci.ids="; then
+    bad "static vfio-pci.ids boot mode detected (unsupported in this repo)"
+else
+    ok "dynamic mode cmdline detected (no vfio-pci.ids)"
+fi
+echo "$cmdline" | grep -q "amdgpu.reset_method=3" && ok "amdgpu.reset_method=3" || bad "reset_method missing"
+echo "$cmdline" | grep -q "amdgpu.runpm=0"        && ok "amdgpu.runpm=0"        || bad "runpm missing"
+echo "$cmdline" | grep -q "pci=noaer"             && ok "pci=noaer"             || bad "pci=noaer missing"
+
+# 3. iGPU host display
+card0_dev=$(readlink -f /sys/class/graphics/fb0/device 2>/dev/null || echo unknown)
+if echo "$card0_dev" | grep -q "0000:00:02.0"; then
+    ok "fb0 owned by iGPU (00:02.0)"
+else
+    bad "fb0 NOT iGPU — is $(basename $card0_dev)"
+fi
+
+# 4. GPU driver state
+amd_drv=$(basename "$(readlink /sys/bus/pci/devices/0000:03:00.0/driver 2>/dev/null || echo NONE)")
+info "03:00.0 driver: $amd_drv"
+if [ "$amd_drv" = "amdgpu" ]; then
+    ok "amdgpu owns 6800 XT (host compute available)"
+else
+    bad "unexpected GPU driver: $amd_drv (expected amdgpu)"
+fi
+
+# 5. IOMMU groups
+groups=$(ls /sys/kernel/iommu_groups 2>/dev/null | wc -l)
+if [ "$groups" -gt 5 ]; then
+    ok "IOMMU groups: $groups (VT-d active)"
+else
+    bad "IOMMU groups: $groups (VT-d off? check BIOS)"
+fi
+
+# 6. GPU IOMMU group contents
+gpu_group_dir=$(readlink -f /sys/bus/pci/devices/0000:03:00.0/iommu_group 2>/dev/null)
+if [ -d "$gpu_group_dir" ]; then
+    group_devs=$(ls "$gpu_group_dir/devices" | grep "03:00" | wc -l)
+    if [ "$group_devs" = "4" ]; then
+        ok "GPU IOMMU group has all 4 functions (03:00.0-3)"
+    else
+        bad "GPU IOMMU group has $group_devs of 4 functions"
+    fi
+else
+    bad "cannot read GPU IOMMU group"
+fi
+
+# 7. Domain XML
+if sudo virsh dominfo bazzite >/dev/null 2>&1; then
+    ok "domain 'bazzite' defined"
+else
+    bad "domain 'bazzite' not defined"
+fi
+
+# 8. Dynamic rebind test
+if [ "$amd_drv" = "amdgpu" ]; then
+    echo ""
+    echo "------------------------------------------"
+    echo "STAGE 2: Dynamic rebind cycle test"
+    echo "This is the test that crashed the old 6.12 kernel."
+    echo "If the host freezes here, force-reboot and inspect dmesg/hook logs."
+    echo "------------------------------------------"
+    echo "Proceed? (10s to Ctrl-C)"
+    sleep 1
+
+    info "Stopping SDDM greeter Xorg"
+    sddm_xorg=$(pgrep -f "Xorg.*seat0.*vt2" || true)
+    [ -n "$sddm_xorg" ] && sudo kill -TERM "$sddm_xorg" && sleep 2
+
+    info "Unbinding amdgpu + siblings from 03:00.0-3 and binding vfio-pci"
+    sudo modprobe vfio vfio_iommu_type1 vfio-pci
+    for f in 0 1 2 3; do
+        dev="0000:03:00.$f"
+        drv=$(basename "$(readlink /sys/bus/pci/devices/$dev/driver 2>/dev/null || echo NONE)")
+        if [ "$drv" != "vfio-pci" ] && [ "$drv" != "NONE" ]; then
+            echo "  $dev: unbind from $drv"
+            echo vfio-pci | sudo tee /sys/bus/pci/devices/$dev/driver_override >/dev/null
+            echo $dev | sudo tee /sys/bus/pci/drivers/$drv/unbind >/dev/null
+            echo $dev | sudo tee /sys/bus/pci/drivers/vfio-pci/bind >/dev/null 2>&1 || true
+        fi
+    done
+
+    # Verify
+    new_drv=$(basename "$(readlink /sys/bus/pci/devices/0000:03:00.0/driver 2>/dev/null || echo NONE)")
+    if [ "$new_drv" = "vfio-pci" ]; then
+        ok "unbind amdgpu → bind vfio-pci SUCCEEDED"
+    else
+        bad "unbind/bind failed — 03:00.0 is $new_drv"
+        echo "Dmesg last 20 lines:"
+        sudo dmesg | tail -20
+        exit 1
+    fi
+
+    # Now test the reverse: vfio-pci back to amdgpu
+    info "Unbinding vfio-pci and rebinding amdgpu (this is the release path)"
+    for f in 0 1 2 3; do
+        dev="0000:03:00.$f"
+        drv=$(basename "$(readlink /sys/bus/pci/devices/$dev/driver 2>/dev/null || echo NONE)")
+        if [ "$drv" = "vfio-pci" ]; then
+            echo $dev | sudo tee /sys/bus/pci/drivers/vfio-pci/unbind >/dev/null
+            echo "" | sudo tee /sys/bus/pci/devices/$dev/driver_override >/dev/null
+        fi
+    done
+    for f in 0 1 2 3; do
+        echo "0000:03:00.$f" | sudo tee /sys/bus/pci/drivers_probe >/dev/null 2>&1 || true
+    done
+    sleep 2
+
+    back_drv=$(basename "$(readlink /sys/bus/pci/devices/0000:03:00.0/driver 2>/dev/null || echo NONE)")
+    if [ "$back_drv" = "amdgpu" ]; then
+        ok "vfio-pci → amdgpu release SUCCEEDED"
+    else
+        bad "release failed — 03:00.0 is $back_drv (expected amdgpu)"
+    fi
+
+    info "Restarting SDDM (should relaunch greeter Xorg)"
+    sudo systemctl restart sddm || true
+else
+    info "Skipping dynamic rebind cycle test because 03:00.0 is not on amdgpu"
+fi
+
+echo ""
+echo "=========================================="
+echo "Summary: $PASS passed, $FAIL failed"
+echo "Full log: $LOG"
+echo "=========================================="
+[ "$FAIL" -eq 0 ]

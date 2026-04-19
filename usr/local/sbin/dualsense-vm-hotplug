@@ -1,0 +1,72 @@
+#!/bin/bash
+# Reattach wired DualSense USB (054c:0ce6) to the running bazzite VM.
+# This is triggered by udev add/remove events so unplug/replug works.
+
+set -u
+
+ACTION="${1:-}"
+VM="bazzite"
+LOG=/var/log/libvirt-hooks.log
+LOCK=/run/dualsense-vm-hotplug.lock
+XML=/run/dualsense-vm-usb.xml
+
+log() {
+    echo "[$(date '+%F %T')] dualsense-usb-hotplug: $*"
+}
+
+cleanup() {
+    rm -f "$XML"
+}
+
+trap cleanup EXIT
+
+exec >>"$LOG" 2>&1
+
+if [ "$ACTION" != "add" ] && [ "$ACTION" != "remove" ]; then
+    log "ignore unknown action='$ACTION'"
+    exit 0
+fi
+
+exec 9>"$LOCK"
+if ! flock -w 15 9; then
+    log "lock timeout; skipping action='$ACTION'"
+    exit 0
+fi
+
+if ! virsh -c qemu:///system domstate "$VM" 2>/dev/null | grep -q running; then
+    log "vm '$VM' not running; skipping action='$ACTION'"
+    exit 0
+fi
+
+cat >"$XML" <<'EOF'
+<hostdev mode='subsystem' type='usb' managed='yes'>
+  <source startupPolicy='optional'>
+    <vendor id='0x054c'/>
+    <product id='0x0ce6'/>
+  </source>
+</hostdev>
+EOF
+
+detach_device() {
+    virsh -c qemu:///system detach-device "$VM" "$XML" --live >/dev/null 2>&1 || true
+}
+
+attach_device() {
+    virsh -c qemu:///system attach-device "$VM" "$XML" --live >/dev/null 2>&1
+}
+
+case "$ACTION" in
+    remove)
+        detach_device
+        log "processed remove"
+        ;;
+    add)
+        sleep 1
+        detach_device
+        if attach_device; then
+            log "attached wired DualSense"
+        else
+            log "attach failed"
+        fi
+        ;;
+esac
